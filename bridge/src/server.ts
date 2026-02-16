@@ -4,6 +4,7 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
+import http from 'http';
 import { WhatsAppClient, InboundMessage } from './whatsapp.js';
 
 interface SendCommand {
@@ -17,25 +18,71 @@ interface BridgeMessage {
   [key: string]: unknown;
 }
 
+interface HealthPayload {
+  status: 'healthy' | 'unhealthy';
+  whatsapp: 'connected' | 'disconnected';
+  authedClients: number;
+}
+
+export function computeHealthPayload(
+  whatsappConnected: boolean,
+  authedClients: number,
+): HealthPayload {
+  return {
+    status: whatsappConnected ? 'healthy' : 'unhealthy',
+    whatsapp: whatsappConnected ? 'connected' : 'disconnected',
+    authedClients,
+  };
+}
+
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
+  private healthServer: http.Server | null = null;
+  private whatsappConnected = false;
 
-  constructor(private port: number, private authDir: string, private token?: string) {}
+  constructor(
+    private port: number,
+    private authDir: string,
+    private token?: string,
+    private healthPort?: number,
+    private host: string = '127.0.0.1',
+  ) {}
 
   async start(): Promise<void> {
     // Bind to localhost only — never expose to external network
-    this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.port });
-    console.log(`🌉 Bridge server listening on ws://127.0.0.1:${this.port}`);
+    this.wss = new WebSocketServer({ host: this.host, port: this.port });
+    console.log(`🌉 Bridge server listening on ws://${this.host}:${this.port}`);
     if (this.token) console.log('🔒 Token authentication enabled');
+
+    const healthPort = this.healthPort ?? this.port + 1;
+    this.healthServer = http.createServer((req, res) => {
+      if (!req.url || req.url !== '/health') {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+        return;
+      }
+
+      const payload = computeHealthPayload(this.whatsappConnected, this.clients.size);
+      const statusCode = payload.status === 'healthy' ? 200 : 503;
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload));
+    });
+
+    this.healthServer.listen(healthPort, this.host, () => {
+      console.log(`🩺 Healthcheck listening on http://${this.host}:${healthPort}/health`);
+    });
 
     // Initialize WhatsApp client
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
       onMessage: (msg) => this.broadcast({ type: 'message', ...msg }),
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
-      onStatus: (status) => this.broadcast({ type: 'status', status }),
+      onStatus: (status) => {
+        this.whatsappConnected = status === 'connected';
+        this.broadcast({ type: 'status', status });
+      },
     });
 
     // Handle WebSocket connections
@@ -69,6 +116,9 @@ export class BridgeServer {
 
   private setupClient(ws: WebSocket): void {
     this.clients.add(ws);
+    if (this.clients.size === 1) {
+      console.log('🟢 First authenticated client connected');
+    }
 
     ws.on('message', async (data) => {
       try {
@@ -84,11 +134,17 @@ export class BridgeServer {
     ws.on('close', () => {
       console.log('🔌 Python client disconnected');
       this.clients.delete(ws);
+      if (this.clients.size === 0) {
+        console.log('🟡 No authenticated clients connected');
+      }
     });
 
     ws.on('error', (error) => {
       console.error('WebSocket error:', error);
       this.clients.delete(ws);
+      if (this.clients.size === 0) {
+        console.log('🟡 No authenticated clients connected');
+      }
     });
   }
 
@@ -118,6 +174,12 @@ export class BridgeServer {
     if (this.wss) {
       this.wss.close();
       this.wss = null;
+    }
+
+    // Close health server
+    if (this.healthServer) {
+      this.healthServer.close();
+      this.healthServer = null;
     }
 
     // Disconnect WhatsApp
